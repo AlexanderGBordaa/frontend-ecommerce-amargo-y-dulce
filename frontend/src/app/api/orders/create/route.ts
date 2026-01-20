@@ -33,6 +33,24 @@ async function strapiJSON(res: Response) {
   return data;
 }
 
+function badRequest(msg: string, fields?: Record<string, any>) {
+  return NextResponse.json({ error: msg, fields }, { status: 400 });
+}
+
+function readShipping(obj: any) {
+  const s = obj?.shippingAddress ?? null;
+  return {
+    street: isNonEmptyString(s?.street) ? s.street.trim() : "",
+    number: isNonEmptyString(s?.number) ? s.number.trim() : "",
+    city: isNonEmptyString(s?.city) ? s.city.trim() : "",
+    province: isNonEmptyString(s?.province) ? s.province.trim() : "",
+    postalCode: isNonEmptyString(s?.postalCode) ? s.postalCode.trim() : "",
+    notes: isNonEmptyString(s?.notes) ? s.notes.trim() : "",
+    // text puede venir o lo generamos
+    text: isNonEmptyString(s?.text) ? s.text.trim() : "",
+  };
+}
+
 export async function POST(req: Request) {
   const strapiBase = normalizeStrapiBase(
     process.env.STRAPI_URL ||
@@ -40,10 +58,10 @@ export async function POST(req: Request) {
       "http://localhost:1337"
   );
 
-  const token = process.env.STRAPI_TOKEN;
+  const token = process.env.STRAPI_TOKEN || process.env.STRAPI_API_TOKEN;
   if (!token) {
     return NextResponse.json(
-      { error: "Falta STRAPI_TOKEN en .env.local (Next)" },
+      { error: "Falta STRAPI_TOKEN / STRAPI_API_TOKEN en .env.local (Next)" },
       { status: 500 }
     );
   }
@@ -69,21 +87,74 @@ export async function POST(req: Request) {
     );
   }
 
+  // ===================== VALIDACIONES server-side (obligatorios) =====================
+
+  const name = isNonEmptyString(incomingData.name) ? incomingData.name.trim() : "";
+  const email = isNonEmptyString(incomingData.email) ? incomingData.email.trim() : "";
+  const phone = isNonEmptyString(incomingData.phone) ? incomingData.phone.trim() : "";
+
+  if (name.length < 2) return badRequest("Nombre inválido", { name });
+  if (!email.includes("@")) return badRequest("Email inválido", { email });
+  if (phone.length < 6) return badRequest("Teléfono inválido", { phone });
+
+  const shipping = readShipping(incomingData);
+
+  if (shipping.street.length < 2) return badRequest("Falta street", { street: shipping.street });
+  if (shipping.number.length < 1) return badRequest("Falta number", { number: shipping.number });
+  if (shipping.city.length < 2) return badRequest("Falta city", { city: shipping.city });
+  if (shipping.province.length < 2) return badRequest("Falta province", { province: shipping.province });
+  if (shipping.postalCode.length < 4) return badRequest("Falta postalCode", { postalCode: shipping.postalCode });
+
+  // items mínimos
+  const items = Array.isArray(incomingData.items) ? incomingData.items : [];
+  if (items.length === 0) return badRequest("Tu carrito está vacío (items).");
+
+  // total mínimo
+  const total = Number(incomingData.total);
+  if (!Number.isFinite(total) || total <= 0) return badRequest("Total inválido", { total: incomingData.total });
+
+  // ===================== Normalizaciones =====================
+
   // mpExternalReference server-side (si no viene)
   const mpExternalReference = isNonEmptyString(incomingData.mpExternalReference)
     ? incomingData.mpExternalReference.trim()
     : safeUUID();
 
+  // si no vino text, lo generamos acá para consistencia
+  const shippingText =
+    shipping.text ||
+    `${shipping.street} ${shipping.number}, ${shipping.city}, ${shipping.province} (${shipping.postalCode})`;
+
   // 1) CREATE en Strapi
   const createPayload = {
     data: {
+      // No confiamos en que el cliente mande todo perfecto: sobreescribimos normalizados
       ...incomingData,
+      name,
+      email,
+      phone,
+      total,
+      items,
+
+      shippingAddress: {
+        street: shipping.street,
+        number: shipping.number,
+        city: shipping.city,
+        province: shipping.province,
+        postalCode: shipping.postalCode,
+        notes: shipping.notes || null,
+        text: shippingText,
+      },
+
       mpExternalReference,
       // NO ponemos orderNumber acá porque todavía no tenemos numericId con certeza
     },
   };
 
-  console.log("[orders/create] → Strapi CREATE payload:", JSON.stringify(createPayload, null, 2));
+  console.log(
+    "[orders/create] → Strapi CREATE payload:",
+    JSON.stringify(createPayload, null, 2)
+  );
 
   const createRes = await fetch(`${strapiBase}/api/orders`, {
     method: "POST",
@@ -110,7 +181,6 @@ export async function POST(req: Request) {
   const numericId = created?.data?.id ? String(created.data.id) : null;
 
   if (!documentId) {
-    // raro, pero por las dudas
     return NextResponse.json(
       {
         error: "Strapi no devolvió documentId al crear la orden",
@@ -123,19 +193,20 @@ export async function POST(req: Request) {
   const orderNumber = numericId ? makeOrderNumber(numericId) : null;
 
   // 2) UPDATE en Strapi para setear orderNumber (si pudimos calcularlo)
-  //    Si numericId no viene, igual devolvemos ok (solo no seteamos orderNumber)
   if (orderNumber) {
     const updatePayload = {
       data: {
         orderNumber,
-        // opcional: reforzamos mpExternalReference
         mpExternalReference,
       },
     };
 
     const updateUrl = `${strapiBase}/api/orders/${encodeURIComponent(documentId)}`;
     console.log("[orders/create] → Strapi UPDATE url:", updateUrl);
-    console.log("[orders/create] → Strapi UPDATE payload:", JSON.stringify(updatePayload, null, 2));
+    console.log(
+      "[orders/create] → Strapi UPDATE payload:",
+      JSON.stringify(updatePayload, null, 2)
+    );
 
     const updateRes = await fetch(updateUrl, {
       method: "PUT",
@@ -149,11 +220,17 @@ export async function POST(req: Request) {
 
     if (!updateRes.ok) {
       const upd = await updateRes.text().catch(() => "");
-      console.warn("[orders/create] Strapi UPDATE failed (no bloqueo):", updateRes.status, upd);
+      console.warn(
+        "[orders/create] Strapi UPDATE failed (no bloqueo):",
+        updateRes.status,
+        upd
+      );
       // No bloqueamos: la orden ya existe y el pago puede seguir.
     }
   } else {
-    console.warn("[orders/create] Strapi no devolvió numericId; no pude calcular orderNumber.");
+    console.warn(
+      "[orders/create] Strapi no devolvió numericId; no pude calcular orderNumber."
+    );
   }
 
   // 3) Respuesta útil al front

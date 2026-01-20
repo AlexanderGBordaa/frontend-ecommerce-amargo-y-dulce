@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { Container } from "@/components/layout/Container";
+import { useCartStore } from "@/store/cart.store";
 
 type StatusKind = "success" | "pending" | "failure" | "unknown";
 
@@ -79,9 +80,125 @@ function StatusBadge({ status }: { status: StatusKind }) {
 export default function GraciasPage() {
   const sp = useSearchParams();
 
-  const status = normalizeStatus(sp.get("status"));
+  const clear = useCartStore((s) => s.clear);
+
+  const urlStatus = normalizeStatus(sp.get("status"));
   const orderId = sp.get("orderId") || "";
   const externalRef = sp.get("external_reference") || "";
+
+  // Estado real según Strapi (orderStatus). Arrancamos usando el status de URL.
+  const [status, setStatus] = useState<StatusKind>(urlStatus);
+  const [hint, setHint] = useState<string | null>(null);
+
+  // Para evitar clear() duplicado
+  const clearedRef = useRef(false);
+
+  useEffect(() => {
+    // si cambia la URL, reseteamos el estado visible y el hint
+    setStatus(urlStatus);
+    setHint(null);
+    clearedRef.current = false;
+  }, [urlStatus]);
+
+  useEffect(() => {
+    if (!orderId) return;
+
+    let alive = true;
+    const startedAt = Date.now();
+
+    function mapOrderStatusToUi(orderStatus: string | null | undefined): StatusKind {
+      const s = String(orderStatus ?? "").toLowerCase();
+      if (s === "paid") return "success";
+      if (s === "failed" || s === "cancelled") return "failure";
+      return "pending";
+    }
+
+    async function tick() {
+      try {
+        const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}`, {
+          cache: "no-store",
+        });
+        const json = await res.json().catch(() => null);
+
+        if (!alive) return;
+
+        const orderStatus: string | null =
+          json?.data?.attributes?.orderStatus ??
+          json?.orderStatus ??
+          json?.data?.orderStatus ??
+          null;
+
+        const nextUi = mapOrderStatusToUi(orderStatus);
+
+        // si está paid, vaciamos carrito una sola vez
+        if (nextUi === "success" && !clearedRef.current) {
+          clearedRef.current = true;
+          clear();
+        }
+
+        setStatus(nextUi);
+
+        // timeout de verificación
+        if (Date.now() - startedAt > 30_000 && nextUi === "pending") {
+          setHint(
+            "Todavía no pudimos confirmar el pago. Podés refrescar la página o revisar tu email: el webhook puede tardar unos segundos."
+          );
+        } else {
+          setHint(null);
+        }
+      } catch {
+        if (!alive) return;
+        if (Date.now() - startedAt > 30_000) {
+          setHint(
+            "Tuvimos un problema verificando el estado. Podés refrescar la página o revisar tu email."
+          );
+        }
+      }
+    }
+
+    // ✅ Fast start + backoff:
+    // - 0–8s: cada 500ms
+    // - 8–30s: cada 2500ms
+    // - corta a 30s
+    tick();
+
+    let delay = 500;
+    let timer: any = null;
+
+    const schedule = () => {
+      timer = setTimeout(async () => {
+        await tick();
+
+        const elapsed = Date.now() - startedAt;
+
+        if (elapsed > 8_000) delay = 2500;
+        if (elapsed > 30_000) return;
+
+        // si ya resolvimos (success/failure), no seguimos pegándole a Strapi
+        if (!alive) return;
+        if (status === "success" || status === "failure") return;
+
+        schedule();
+      }, delay);
+    };
+
+    schedule();
+
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderId, clear]);
+
+  const statusLabel =
+    status === "success"
+      ? "Aprobado"
+      : status === "pending"
+      ? "Pendiente"
+      : status === "failure"
+      ? "Rechazado"
+      : "—";
 
   return (
     <main>
@@ -113,15 +230,7 @@ export default function GraciasPage() {
 
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-neutral-600">Estado</span>
-                <span className="font-semibold text-neutral-900">
-                  {status === "success"
-                    ? "Aprobado"
-                    : status === "pending"
-                    ? "Pendiente"
-                    : status === "failure"
-                    ? "Rechazado"
-                    : "—"}
-                </span>
+                <span className="font-semibold text-neutral-900">{statusLabel}</span>
               </div>
             </div>
 
@@ -152,7 +261,14 @@ export default function GraciasPage() {
             {/* Hint */}
             {status === "pending" && (
               <p className="mt-4 text-xs text-neutral-500">
-                Si el estado no cambia, refrescá la página o revisá tu email. El webhook puede tardar unos segundos.
+                {hint ||
+                  "Si el estado no cambia, refrescá la página o revisá tu email. El webhook puede tardar unos segundos."}
+              </p>
+            )}
+
+            {status === "success" && (
+              <p className="mt-4 text-xs text-neutral-500">
+                Si no te llega el email de confirmación, revisá Spam/Promociones.
               </p>
             )}
           </div>
@@ -161,3 +277,4 @@ export default function GraciasPage() {
     </main>
   );
 }
+

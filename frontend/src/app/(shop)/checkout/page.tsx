@@ -56,28 +56,52 @@ export default function CheckoutPage() {
   const router = useRouter();
   const sp = useSearchParams();
 
-  useEffect(() => {
-  const redirectedStatus = sp.get("status");
-  const redirectedOrderId = sp.get("orderId");
-  if (redirectedOrderId && redirectedStatus) {
-    router.replace(`/gracias?status=${encodeURIComponent(redirectedStatus)}&orderId=${encodeURIComponent(redirectedOrderId)}`);
-  }
-}, [sp, router]);
-
-
   const cartItems = useCartStore((s) => s.items);
   const clear = useCartStore((s) => s.clear);
 
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+
+  // ✅ obligatorios
+  const [phone, setPhone] = useState("");
+
+  // ✅ shippingAddress estructurado (obligatorios salvo notes)
+  const [street, setStreet] = useState("");
+  const [number, setNumber] = useState("");
+  const [city, setCity] = useState("");
+  const [province, setProvince] = useState("");
+  const [postalCode, setPostalCode] = useState("");
+  const [notes, setNotes] = useState("");
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const trimmedName = name.trim();
   const trimmedEmail = email.trim();
+  const trimmedPhone = phone.trim();
+
+  const trimmedStreet = street.trim();
+  const trimmedNumber = number.trim();
+  const trimmedCity = city.trim();
+  const trimmedProvince = province.trim();
+  const trimmedPostalCode = postalCode.trim();
+  const trimmedNotes = notes.trim();
 
   const redirectedStatus = sp.get("status") || "";
   const redirectedOrderId = sp.get("orderId") || "";
+
+  // ✅ Redirigir a /gracias si vuelve con query (evita duplicación de lógica)
+  useEffect(() => {
+    const status = sp.get("status");
+    const orderId = sp.get("orderId");
+    if (orderId && status) {
+      router.replace(
+        `/gracias?status=${encodeURIComponent(status)}&orderId=${encodeURIComponent(
+          orderId
+        )}`
+      );
+    }
+  }, [sp, router]);
 
   const [ui, setUi] = useState<UiState>(() =>
     redirectedOrderId
@@ -87,7 +111,11 @@ export default function CheckoutPage() {
 
   useEffect(() => {
     if (redirectedOrderId) {
-      setUi({ kind: "checking", orderId: redirectedOrderId, status: redirectedStatus });
+      setUi({
+        kind: "checking",
+        orderId: redirectedOrderId,
+        status: redirectedStatus,
+      });
     } else {
       setUi({ kind: "form" });
     }
@@ -119,6 +147,7 @@ export default function CheckoutPage() {
 
         if (!alive) return;
 
+        // soporta v4 y v5
         const orderStatus =
           json?.data?.attributes?.orderStatus ?? json?.orderStatus ?? null;
 
@@ -149,10 +178,10 @@ export default function CheckoutPage() {
       alive = false;
       clearInterval(id);
     };
-  }, [ui]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ui, clear]);
 
   /* ================= submit ================= */
-
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -161,6 +190,15 @@ export default function CheckoutPage() {
     if (!cartItems.length) return setError("Tu carrito está vacío.");
     if (trimmedName.length < 2) return setError("Ingresá un nombre válido.");
     if (!trimmedEmail.includes("@")) return setError("Ingresá un email válido.");
+
+    // ✅ obligatorios
+    if (trimmedPhone.length < 6) return setError("Ingresá un teléfono válido.");
+    if (trimmedStreet.length < 2) return setError("Ingresá la calle.");
+    if (trimmedNumber.length < 1) return setError("Ingresá el número/altura.");
+    if (trimmedCity.length < 2) return setError("Ingresá la ciudad.");
+    if (trimmedProvince.length < 2) return setError("Ingresá la provincia.");
+    if (trimmedPostalCode.length < 4)
+      return setError("Ingresá un código postal válido.");
 
     try {
       setLoading(true);
@@ -174,6 +212,21 @@ export default function CheckoutPage() {
         body: JSON.stringify({
           name: trimmedName,
           email: trimmedEmail,
+
+          phone: trimmedPhone,
+
+          shippingAddress: {
+            street: trimmedStreet,
+            number: trimmedNumber,
+            city: trimmedCity,
+            province: trimmedProvince,
+            postalCode: trimmedPostalCode,
+            notes: trimmedNotes || null,
+
+            // ✅ legible
+            text: `${trimmedStreet} ${trimmedNumber}, ${trimmedCity}, ${trimmedProvince} (${trimmedPostalCode})`,
+          },
+
           total,
           mpExternalReference,
           items: cartItems.map((it) => ({
@@ -194,18 +247,15 @@ export default function CheckoutPage() {
       }
 
       // ✅ Strapi v5: el ID real para operar por /api/orders/:id es documentId
-      const orderId: string | undefined =
-        created?.orderDocumentId || created?.orderId; // fallback por si tu API todavía devuelve orderId viejo
-
+      const orderId: string | undefined = created?.orderDocumentId || created?.orderId;
       const orderNumericId: string | undefined = created?.orderNumericId;
       const mpExtFromServer: string | undefined = created?.mpExternalReference;
 
-      if (!orderId) throw new Error("No se recibió orderDocumentId/orderId desde /api/orders/create");
+      if (!orderId) {
+        throw new Error("No se recibió orderDocumentId/orderId desde /api/orders/create");
+      }
 
-      // ✅ Si el server generó otro mpExternalReference, usamos ese (debería coincidir)
       const mpExternalReferenceFinal = mpExtFromServer || mpExternalReference;
-
-      // ✅ Para el número “AMG-00XX” usamos el numérico si existe; sino caemos al orderId
       const orderNumber = makeOrderNumber(orderNumericId || orderId);
 
       /* 2️⃣ Preferencia MP */
@@ -215,7 +265,9 @@ export default function CheckoutPage() {
           qty: Number(it.qty ?? 1),
           unit_price: Number(priceWithOff(it.price, it.off)),
         }))
-        .filter((x) => x.qty > 0 && Number.isFinite(x.unit_price) && x.unit_price > 0);
+        .filter(
+          (x) => x.qty > 0 && Number.isFinite(x.unit_price) && x.unit_price > 0
+        );
 
       if (mpItems.length === 0) {
         throw new Error("No hay items válidos para MercadoPago (precio/cantidad).");
@@ -227,7 +279,7 @@ export default function CheckoutPage() {
         body: JSON.stringify({
           orderId, // ✅ documentId
           orderNumber,
-          mpExternalReference: mpExternalReferenceFinal, // ✅ el mismo que quedó guardado en Strapi
+          mpExternalReference: mpExternalReferenceFinal,
           items: mpItems,
         }),
       });
@@ -237,8 +289,12 @@ export default function CheckoutPage() {
         throw new Error(pickErrorMessage(pref, "No se pudo crear la preferencia MP"));
       }
 
-      const checkoutUrl: string | undefined = pref?.sandbox_init_point || pref?.init_point;
-      if (!checkoutUrl) throw new Error("MercadoPago no devolvió init_point / sandbox_init_point.");
+      const checkoutUrl: string | undefined =
+        pref?.sandbox_init_point || pref?.init_point;
+
+      if (!checkoutUrl) {
+        throw new Error("MercadoPago no devolvió init_point / sandbox_init_point.");
+      }
 
       window.location.href = checkoutUrl;
     } catch (err: any) {
@@ -247,8 +303,6 @@ export default function CheckoutPage() {
       setLoading(false);
     }
   }
-
-
 
   /* ================= UI ================= */
 
@@ -272,6 +326,7 @@ export default function CheckoutPage() {
               className="w-full border p-2"
               required
             />
+
             <input
               value={email}
               onChange={(e) => setEmail(e.target.value)}
@@ -281,10 +336,79 @@ export default function CheckoutPage() {
               required
             />
 
+            <input
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              placeholder="Teléfono"
+              type="tel"
+              className="w-full border p-2"
+              required
+            />
+
+            <input
+              value={street}
+              onChange={(e) => setStreet(e.target.value)}
+              placeholder="Calle"
+              className="w-full border p-2"
+              required
+            />
+
+            <input
+              value={number}
+              onChange={(e) => setNumber(e.target.value)}
+              placeholder="Número / Altura"
+              className="w-full border p-2"
+              required
+            />
+
+            <input
+              value={city}
+              onChange={(e) => setCity(e.target.value)}
+              placeholder="Ciudad"
+              className="w-full border p-2"
+              required
+            />
+
+            <input
+              value={province}
+              onChange={(e) => setProvince(e.target.value)}
+              placeholder="Provincia"
+              className="w-full border p-2"
+              required
+            />
+
+            <input
+              value={postalCode}
+              onChange={(e) => setPostalCode(e.target.value)}
+              placeholder="Código postal"
+              className="w-full border p-2"
+              inputMode="numeric"
+              required
+            />
+
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="Notas (piso, depto, referencia, timbre...) (opcional)"
+              className="w-full border p-2"
+              rows={2}
+            />
+
+            <div className="rounded border p-3 text-sm">
+              <div className="flex items-center justify-between">
+                <span>Subtotal</span>
+                <span>{formatARS(subtotal)}</span>
+              </div>
+              <div className="mt-2 flex items-center justify-between font-semibold">
+                <span>Total</span>
+                <span>{formatARS(total)}</span>
+              </div>
+            </div>
+
             <button
               type="submit"
               disabled={loading}
-              className="w-full rounded bg-red-600 py-3 text-white"
+              className="w-full rounded bg-red-600 py-3 text-white disabled:opacity-60"
             >
               {loading ? "Redirigiendo…" : "Pagar con MercadoPago"}
             </button>
@@ -293,6 +417,45 @@ export default function CheckoutPage() {
               Volver al carrito
             </Link>
           </form>
+        )}
+
+        {ui.kind === "checking" && (
+          <div className="max-w-md rounded border p-4">
+            <p className="font-semibold">Estamos verificando tu pago…</p>
+            <p className="text-sm opacity-80">Orden: {ui.orderId}</p>
+          </div>
+        )}
+
+        {ui.kind === "paid" && (
+          <div className="max-w-md rounded border p-4">
+            <p className="font-semibold">¡Pago aprobado!</p>
+            <p className="text-sm opacity-80">Orden: {ui.orderId}</p>
+            <Link href="/" className="mt-3 inline-block underline">
+              Volver a la tienda
+            </Link>
+          </div>
+        )}
+
+        {ui.kind === "failed" && (
+          <div className="max-w-md rounded border p-4">
+            <p className="font-semibold">El pago no se pudo completar.</p>
+            <p className="text-sm opacity-80">Motivo: {ui.reason}</p>
+            <Link href="/carrito" className="mt-3 inline-block underline">
+              Volver al carrito
+            </Link>
+          </div>
+        )}
+
+        {ui.kind === "timeout" && (
+          <div className="max-w-md rounded border p-4">
+            <p className="font-semibold">No pudimos confirmar el pago todavía.</p>
+            <p className="text-sm opacity-80">
+              Podés refrescar en unos segundos o revisar el estado más tarde.
+            </p>
+            <Link href="/" className="mt-3 inline-block underline">
+              Volver a la tienda
+            </Link>
+          </div>
         )}
       </Container>
     </main>

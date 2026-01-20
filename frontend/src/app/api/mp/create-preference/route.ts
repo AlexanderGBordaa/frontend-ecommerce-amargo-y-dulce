@@ -1,20 +1,5 @@
 import { NextResponse } from "next/server";
 
-/**
- * /api/mp/create-preference
- * Crea una preferencia de Checkout Pro (MercadoPago)
- *
- * Requisitos:
- * - MP_ACCESS_TOKEN (server-only)
- * - NEXT_PUBLIC_SITE_URL (URL PUBLICA: ngrok o dominio real; NO localhost si querés webhook)
- *
- * Este handler:
- * - valida items
- * - usa external_reference = orderNumber (si existe) o orderId (Strapi)
- * - agrega orderId y orderNumber a back_urls para polling post-redirect
- * - SIEMPRE manda notification_url (clave para webhook)
- */
-
 export const dynamic = "force-dynamic";
 
 type MPItem = {
@@ -42,7 +27,7 @@ function pickMpErrorMessage(payload: any, fallback: string) {
   return fallback;
 }
 
-// Evita mandar undefined en metadata
+// Evita mandar undefined/null/"" en metadata
 function cleanObject<T extends Record<string, any>>(obj: T): Partial<T> {
   return Object.fromEntries(
     Object.entries(obj).filter(([, v]) => v !== undefined && v !== null && v !== "")
@@ -82,21 +67,33 @@ export async function POST(req: Request) {
     );
   }
 
-  const { orderId, orderNumber, items } = body ?? {};
+  const { orderId, orderNumber, items, mpExternalReference } = body ?? {};
 
   if (!orderId) {
     return NextResponse.json(
-      { error: "Falta orderId (id de Strapi)" },
+      { error: "Falta orderId (id real de Strapi)" },
       { status: 400 }
     );
   }
 
-  // Normalizar items (y asegurarnos que quantity sea entero)
+  if (!mpExternalReference || typeof mpExternalReference !== "string") {
+    return NextResponse.json(
+      {
+        error:
+          "Falta mpExternalReference. Debe venir desde /api/orders/create",
+      },
+      { status: 400 }
+    );
+  }
+
+  // Normalizar items
   const normalizedItems: MPItem[] = (Array.isArray(items) ? items : [])
     .map((it: any) => {
       const title = String(it?.title ?? "Producto").trim();
       const quantityRaw = Number(it?.qty ?? it?.quantity ?? 1);
-      const quantity = Number.isFinite(quantityRaw) ? Math.max(1, Math.floor(quantityRaw)) : 1;
+      const quantity = Number.isFinite(quantityRaw)
+        ? Math.max(1, Math.floor(quantityRaw))
+        : 1;
       const unit_price = Number(it?.unit_price ?? it?.price ?? 0);
 
       return {
@@ -121,30 +118,17 @@ export async function POST(req: Request) {
     );
   }
 
-  // ✅ CORRECCION CLAVE:
-  // external_reference debe ser un identificador que puedas buscar fácil en el webhook.
-  // Preferible orderNumber si existe (más estable y legible), sino orderId.
-  // ✅ DESPUÉS (FIX)
-  const external_reference = String(orderId);
+  // 🔒 CLAVE: usar SIEMPRE el mismo external_reference
+  const external_reference = mpExternalReference;
 
-
-  // ✅ CORRECCION CLAVE:
-  // notification_url debe ser PUBLICA y estable.
-  // Si NEXT_PUBLIC_SITE_URL es localhost, MP NO podrá pegarle.
   const notification_url = `${siteUrl}/api/mp/webhook`;
 
-  // ✅ back_urls con datos útiles para tu pantalla de confirmación/polling
   const back_urls = {
-    success: `${siteUrl}/checkout?status=success&orderId=${encodeURIComponent(
-      String(orderId)
-    )}&external_reference=${encodeURIComponent(external_reference)}`,
-    failure: `${siteUrl}/checkout?status=failure&orderId=${encodeURIComponent(
-      String(orderId)
-    )}&external_reference=${encodeURIComponent(external_reference)}`,
-    pending: `${siteUrl}/checkout?status=pending&orderId=${encodeURIComponent(
-      String(orderId)
-    )}&external_reference=${encodeURIComponent(external_reference)}`,
-  };
+  success: `${siteUrl}/gracias?status=success&orderId=${encodeURIComponent(String(orderId))}`,
+  failure: `${siteUrl}/gracias?status=failure&orderId=${encodeURIComponent(String(orderId))}`,
+  pending: `${siteUrl}/gracias?status=pending&orderId=${encodeURIComponent(String(orderId))}`,
+};
+
 
   const preferenceBody = {
     items: normalizedItems,
@@ -155,28 +139,35 @@ export async function POST(req: Request) {
     metadata: cleanObject({
       orderId: String(orderId),
       orderNumber: orderNumber ? String(orderNumber) : undefined,
+      mpExternalReference: external_reference,
     }),
   };
 
-  console.log("MP preferenceBody:", preferenceBody);
+  console.log("[create-preference] MP preferenceBody:", preferenceBody);
 
-  const res = await fetch("https://api.mercadopago.com/checkout/preferences", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(preferenceBody),
-    cache: "no-store",
-  });
+  const res = await fetch(
+    "https://api.mercadopago.com/checkout/preferences",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(preferenceBody),
+      cache: "no-store",
+    }
+  );
 
   const data = await res.json().catch(() => null);
 
   if (!res.ok) {
-    console.error("MP preference error:", data);
+    console.error("[create-preference] MP error:", data);
     return NextResponse.json(
       {
-        error: pickMpErrorMessage(data, "MercadoPago rechazó la preferencia"),
+        error: pickMpErrorMessage(
+          data,
+          "MercadoPago rechazó la preferencia"
+        ),
         mp: data,
       },
       { status: res.status || 500 }
@@ -187,6 +178,7 @@ export async function POST(req: Request) {
     id: data.id,
     init_point: data.init_point,
     sandbox_init_point: data.sandbox_init_point,
+    mpExternalReference: external_reference,
+    orderId: String(orderId),
   });
 }
-

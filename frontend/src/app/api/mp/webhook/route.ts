@@ -5,23 +5,25 @@ export const dynamic = "force-dynamic";
 
 /**
  * Webhook Mercado Pago (Checkout Pro)
- * - Recibe notificación (query o body)
- * - Consulta el pago real en MP
- * - Actualiza la orden en Strapi con mpPaymentId, mpStatus, orderStatus
  *
- * IMPORTANTE:
- * - external_reference puede ser orderId o orderNumber
- * - Si es orderNumber -> buscamos por filters[orderNumber] y tomamos el id real
+ * Objetivo:
+ * - Recibe notificación (payment / merchant_order)
+ * - Resuelve paymentId real
+ * - Consulta el pago en MP
+ * - Toma mpExternalReference desde payment.external_reference (o metadata)
+ * - Busca la Order en Strapi por filters[mpExternalReference][$eq]
+ * - Actualiza Order: orderStatus + mp* fields
  *
- * FIX para tu 404:
- * - Normalizamos STRAPI_URL para evitar casos donde termina en /api y queda /api/api/...
+ * ✅ Strapi v5 FIX:
+ * - Buscar documentId (NO id)
+ * - Actualizar por /api/orders/:documentId (NO /:id)
  */
 
-function pickPaymentInfo(url: URL, body: any) {
+function pickNotificationInfo(url: URL, body: any) {
   const typeFromQuery =
     url.searchParams.get("type") ||
     url.searchParams.get("topic") ||
-    url.searchParams.get("action"); // a veces viene "payment.created"
+    url.searchParams.get("action");
 
   const qpId =
     url.searchParams.get("data.id") ||
@@ -34,9 +36,9 @@ function pickPaymentInfo(url: URL, body: any) {
   const bodyId = body?.data?.id || body?.data?.["id"] || body?.id;
 
   const type = typeFromQuery || bodyType || undefined;
-  const paymentId = qpId || bodyId || null;
+  const id = qpId || bodyId || null;
 
-  return { type, paymentId: paymentId ? String(paymentId) : null };
+  return { type: type ? String(type) : undefined, id: id ? String(id) : null };
 }
 
 function mapMpToOrderStatus(mpStatus?: string) {
@@ -52,7 +54,6 @@ function mapMpToOrderStatus(mpStatus?: string) {
   }
 }
 
-// ✅ Fix: normaliza base y elimina /api final para evitar /api/api
 function normalizeStrapiBase(url: string) {
   let u = String(url ?? "").trim();
   u = u.endsWith("/") ? u.slice(0, -1) : u;
@@ -60,29 +61,72 @@ function normalizeStrapiBase(url: string) {
   return u;
 }
 
-function isNumericId(v: string) {
-  return /^\d+$/.test(v);
+async function fetchMpPayment(accessToken: string, paymentId: string) {
+  const payRes = await fetch(
+    `https://api.mercadopago.com/v1/payments/${encodeURIComponent(paymentId)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      cache: "no-store",
+    }
+  );
+
+  const payment = await payRes.json().catch(() => null);
+
+  if (!payRes.ok || !payment) {
+    const errText = payment ? JSON.stringify(payment) : "";
+    throw new Error(`MP payment fetch failed (${payRes.status}) ${errText}`);
+  }
+
+  return payment;
 }
 
-async function findOrderIdInStrapi(
+async function resolvePaymentIdFromMerchantOrder(accessToken: string, merchantOrderId: string) {
+  const moRes = await fetch(
+    `https://api.mercadopago.com/merchant_orders/${encodeURIComponent(merchantOrderId)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      cache: "no-store",
+    }
+  );
+
+  const mo = await moRes.json().catch(() => null);
+
+  if (!moRes.ok || !mo) {
+    const errText = mo ? JSON.stringify(mo) : "";
+    throw new Error(`MP merchant_order fetch failed (${moRes.status}) ${errText}`);
+  }
+
+  const payments: any[] = Array.isArray(mo?.payments) ? mo.payments : [];
+  const approved = payments.find((p) => p?.status === "approved" && p?.id);
+  const anyPayment = approved || payments.find((p) => p?.id);
+
+  return anyPayment?.id ? String(anyPayment.id) : null;
+}
+
+/**
+ * ✅ Strapi v5:
+ * devolvemos documentId (no id)
+ */
+async function findOrderDocumentIdByMpExternalReference(
   strapiBase: string,
   token: string,
-  externalRef: string
+  mpExternalReference: string
 ) {
-  // Caso A: external_reference es el id numérico de Strapi
-  if (isNumericId(externalRef)) return externalRef;
-
-  // Caso B: external_reference es orderNumber (ej "AMG-0033")
   const q = new URLSearchParams({
-    "filters[orderNumber][$eq]": externalRef,
+    "filters[mpExternalReference][$eq]": mpExternalReference,
     "pagination[pageSize]": "1",
-    "fields[0]": "id",
+    // pedimos documentId explícitamente
+    "fields[0]": "documentId",
   });
 
   const res = await fetch(`${strapiBase}/api/orders?${q.toString()}`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
+    headers: { Authorization: `Bearer ${token}` },
     cache: "no-store",
   });
 
@@ -93,15 +137,43 @@ async function findOrderIdInStrapi(
     throw new Error(`Strapi search failed (${res.status}) ${text}`);
   }
 
-  const id = data?.data?.[0]?.id;
-  return id ? String(id) : null;
+  const documentId = data?.data?.[0]?.documentId;
+  return documentId ? String(documentId) : null;
+}
+
+async function updateOrderInStrapi(params: {
+  strapiBase: string;
+  token: string;
+  orderDocumentId: string;
+  payload: any;
+}) {
+  const { strapiBase, token, orderDocumentId, payload } = params;
+
+  // ✅ Strapi v5 actualiza por documentId
+  const updateUrl = `${strapiBase}/api/orders/${encodeURIComponent(orderDocumentId)}`;
+
+  const updateRes = await fetch(updateUrl, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payload),
+    cache: "no-store",
+  });
+
+  if (!updateRes.ok) {
+    const text = await updateRes.text().catch(() => "");
+    throw new Error(`Strapi update failed (${updateRes.status}) ${text || "(no body)"}`);
+  }
+
+  return true;
 }
 
 export async function POST(req: Request) {
   try {
     const url = new URL(req.url);
 
-    // Body (a veces viene vacío o no es JSON)
     let body: any = null;
     try {
       body = await req.json();
@@ -109,85 +181,83 @@ export async function POST(req: Request) {
       // ok
     }
 
-    const { type, paymentId } = pickPaymentInfo(url, body);
-
-    // Respuesta rápida
-    if (!paymentId) return NextResponse.json({ ok: true }, { status: 200 });
-
-    // Algunos envían "payment.created" / "payment.updated"
-    if (type && !String(type).includes("payment")) {
-      return NextResponse.json({ ok: true }, { status: 200 });
-    }
+    const { type, id } = pickNotificationInfo(url, body);
+    if (!id) return NextResponse.json({ ok: true }, { status: 200 });
 
     const accessToken = process.env.MP_ACCESS_TOKEN;
     if (!accessToken) {
-      console.error("Webhook: falta MP_ACCESS_TOKEN");
+      console.error("[Webhook] falta MP_ACCESS_TOKEN");
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    // 1) Consultar el pago real en MP
-    const payRes = await fetch(
-      `https://api.mercadopago.com/v1/payments/${encodeURIComponent(paymentId)}`,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        cache: "no-store",
+    let paymentId: string | null = null;
+
+    if (!type || type.includes("payment")) {
+      paymentId = id;
+    } else if (type.includes("merchant_order")) {
+      try {
+        paymentId = await resolvePaymentIdFromMerchantOrder(accessToken, id);
+      } catch (e: any) {
+        console.error("[Webhook] no pude resolver paymentId desde merchant_order:", e?.message || e);
+        return NextResponse.json({ ok: true }, { status: 200 });
       }
-    );
 
-    const payment = await payRes.json().catch(() => null);
+      if (!paymentId) {
+        return NextResponse.json({ ok: true, skipped: "no_payment_yet" }, { status: 200 });
+      }
+    } else {
+      return NextResponse.json({ ok: true, skipped: "unsupported_topic" }, { status: 200 });
+    }
 
-    if (!payRes.ok || !payment) {
-      const errText = payment ? JSON.stringify(payment) : "";
-      console.error("Webhook: MP payment fetch failed", payRes.status, errText);
+    let payment: any;
+    try {
+      payment = await fetchMpPayment(accessToken, paymentId);
+    } catch (e: any) {
+      console.error("[Webhook] MP payment fetch failed:", e?.message || e);
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
     const mpStatus: string | undefined = payment?.status;
     const mpStatusDetail: string | undefined = payment?.status_detail;
 
-    const externalRefRaw =
+    const mpExternalReferenceRaw =
       payment?.external_reference ??
-      payment?.metadata?.orderId ??
-      payment?.metadata?.orderNumber;
+      payment?.metadata?.mpExternalReference ??
+      payment?.metadata?.external_reference;
 
-    if (!externalRefRaw) {
-      console.warn("Webhook: payment sin external_reference / metadata", {
-        paymentId,
-        mpStatus,
-      });
-      return NextResponse.json({ ok: true }, { status: 200 });
+    if (!mpExternalReferenceRaw) {
+      console.warn("[Webhook] pago sin external_reference/mpExternalReference", { paymentId, mpStatus });
+      return NextResponse.json({ ok: true, skipped: "missing_external_reference" }, { status: 200 });
     }
 
-    const externalRef = String(externalRefRaw);
+    const mpExternalReference = String(mpExternalReferenceRaw);
 
-    // 2) Update en Strapi
     const strapiBase = normalizeStrapiBase(
-      process.env.STRAPI_URL ||
-        process.env.NEXT_PUBLIC_STRAPI_URL ||
-        "http://localhost:1337"
+      process.env.STRAPI_URL || process.env.NEXT_PUBLIC_STRAPI_URL || "http://localhost:1337"
     );
 
-    const token = process.env.STRAPI_API_TOKEN || process.env.STRAPI_TOKEN;
+    const token = process.env.STRAPI_TOKEN || process.env.STRAPI_API_TOKEN;
     if (!token) {
-      console.error("Webhook: falta STRAPI_API_TOKEN / STRAPI_TOKEN");
+      console.error("[Webhook] falta STRAPI_API_TOKEN / STRAPI_TOKEN");
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    // ✅ FIX PRINCIPAL: resolver el ID real de la orden
-    let orderId: string | null = null;
+    // ✅ buscar documentId (Strapi v5)
+    let orderDocumentId: string | null = null;
     try {
-      orderId = await findOrderIdInStrapi(strapiBase, token, externalRef);
+      orderDocumentId = await findOrderDocumentIdByMpExternalReference(
+        strapiBase,
+        token,
+        mpExternalReference
+      );
     } catch (e: any) {
-      console.error("Webhook: no pude resolver orderId en Strapi", e?.message || e);
+      console.error("[Webhook] no pude buscar order por mpExternalReference:", e?.message || e);
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    if (!orderId) {
-      console.warn("Webhook: order no encontrada en Strapi para externalRef:", externalRef);
-      return NextResponse.json({ ok: true }, { status: 200 });
+    if (!orderDocumentId) {
+      console.warn("[Webhook] order NO encontrada para mpExternalReference:", mpExternalReference);
+      return NextResponse.json({ ok: true, skipped: "order_not_found" }, { status: 200 });
     }
 
     const orderStatus = mapMpToOrderStatus(mpStatus);
@@ -199,39 +269,34 @@ export async function POST(req: Request) {
         mpStatus: mpStatus ? String(mpStatus) : null,
         mpStatusDetail: mpStatusDetail ? String(mpStatusDetail) : null,
         mpMerchantOrderId: payment?.order?.id ? String(payment.order.id) : null,
-        mpExternalReference: externalRef, // ahora existe en Strapi (schema.json)
+        mpExternalReference,
       },
     };
 
-    const updateUrl = `${strapiBase}/api/orders/${encodeURIComponent(orderId)}`;
     console.log("[Webhook] strapiBase:", strapiBase);
-    console.log("[Webhook] orderId resolved:", orderId);
-    console.log("[Webhook] update URL:", updateUrl);
+    console.log("[Webhook] topic/type:", type);
+    console.log("[Webhook] paymentId:", paymentId);
+    console.log("[Webhook] mpExternalReference:", mpExternalReference);
+    console.log("[Webhook] orderDocumentId:", orderDocumentId);
 
-    const updateRes = await fetch(updateUrl, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(updatePayload),
-      cache: "no-store",
-    });
-
-    if (!updateRes.ok) {
-      const text = await updateRes.text().catch(() => "");
-      console.error("Webhook: Strapi update failed", updateRes.status, text || "(no body)");
+    try {
+      await updateOrderInStrapi({
+        strapiBase,
+        token,
+        orderDocumentId,
+        payload: updatePayload,
+      });
+    } catch (e: any) {
+      console.error("[Webhook] Strapi update failed:", e?.message || e);
     }
 
     return NextResponse.json({ ok: true }, { status: 200 });
   } catch (err: any) {
-    console.error("Webhook: fatal error", err?.message || err);
+    console.error("[Webhook] fatal error:", err?.message || err);
     return NextResponse.json({ ok: true }, { status: 200 });
   }
 }
 
-// Por compatibilidad (algunas configs viejas envían GET)
 export async function GET(req: Request) {
   return POST(req);
 }
-

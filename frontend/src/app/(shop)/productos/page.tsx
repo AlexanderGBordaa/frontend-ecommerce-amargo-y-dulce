@@ -17,13 +17,31 @@ function formatARS(n: number) {
   return n.toLocaleString("es-AR", { style: "currency", currency: "ARS" });
 }
 
-export default async function ProductosPage() {
+export default async function ProductosPage({
+  searchParams,
+}: {
+  searchParams?: { q?: string };
+}) {
+  const qRaw = (searchParams?.q || "").trim();
+  const q = qRaw.length ? qRaw : "";
+
   let products: any[] = [];
   let errorMsg: string | null = null;
 
   try {
+    const sp = new URLSearchParams();
+    sp.set("populate", "*");
+    sp.set("pagination[pageSize]", "100");
+
+    if (q) {
+      // ✅ Búsqueda por varios campos (si alguno no existe en tu modelo, no rompe: simplemente no matchea)
+      sp.set("filters[$or][0][title][$containsi]", q);
+      sp.set("filters[$or][1][slug][$containsi]", q);
+      sp.set("filters[$or][2][description][$containsi]", q);
+    }
+
     const res = await fetcher<StrapiListResponse<ProductAttributes>>(
-      "/api/products?populate=*"
+      `/api/products?${sp.toString()}`
     );
 
     const raw = Array.isArray(res?.data) ? res.data : [];
@@ -41,8 +59,23 @@ export default async function ProductosPage() {
         <div className="py-10">
           <h1 className="text-3xl font-extrabold text-neutral-900">Productos</h1>
           <p className="mt-2 text-sm text-neutral-600">
-            Explorá nuestros productos.
+            {q ? (
+              <>
+                Resultados para{" "}
+                <span className="font-semibold text-neutral-900">“{q}”</span>
+              </>
+            ) : (
+              "Explorá nuestros productos."
+            )}
           </p>
+
+          {q && (
+            <div className="mt-4">
+              <Link href="/productos" className="text-sm underline text-neutral-700">
+                Limpiar búsqueda
+              </Link>
+            </div>
+          )}
         </div>
 
         {errorMsg ? (
@@ -57,7 +90,13 @@ export default async function ProductosPage() {
           </div>
         ) : products.length === 0 ? (
           <div className="rounded-xl border bg-white p-6 text-sm text-neutral-700">
-            No hay productos todavía. Cargalos en Strapi y volvé a intentar.
+            {q ? (
+              <>
+                No encontramos resultados para <b>“{q}”</b>.
+              </>
+            ) : (
+              "No hay productos todavía. Cargalos en Strapi y volvé a intentar."
+            )}
           </div>
         ) : (
           <div className="pb-14">
@@ -73,7 +112,7 @@ export default async function ProductosPage() {
                 return (
                   <Link
                     key={p.slug ?? p.id}
-                   href={`/productos/${p.id}`}
+                    href={`/productos/${p.id}`}
                     className="group overflow-hidden rounded-2xl border bg-white shadow-sm transition hover:shadow-md"
                   >
                     {/* ✅ Imagen desde p.imageUrl (sale del mapper) */}
@@ -123,7 +162,9 @@ export default async function ProductosPage() {
                             )}
                           </div>
                         ) : (
-                          <div className="text-sm text-neutral-600">Precio no disponible</div>
+                          <div className="text-sm text-neutral-600">
+                            Precio no disponible
+                          </div>
                         )}
                       </div>
 

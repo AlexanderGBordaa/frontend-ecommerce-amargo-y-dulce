@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Container } from "./Container";
 import { Search, ShoppingCart, User, Menu, X } from "lucide-react";
 import { LoginModal } from "@/components/auth/LoginModal";
@@ -28,9 +29,16 @@ function NavLink({
 }
 
 export function Header() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const sp = useSearchParams();
+
   const [mobileOpen, setMobileOpen] = useState(false);
   const [loginOpen, setLoginOpen] = useState(false);
   const [scrolled, setScrolled] = useState(false);
+
+  // ✅ buscador (desktop + mobile comparten estado)
+  const [query, setQuery] = useState("");
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 8);
@@ -50,6 +58,26 @@ export function Header() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // ✅ si estoy en /productos, sincronizo el input con ?q=
+  useEffect(() => {
+    if (pathname === "/productos") {
+      setQuery(sp.get("q") || "");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pathname, sp]);
+
+  function goSearch(raw: string) {
+    const q = raw.trim();
+    setMobileOpen(false);
+
+    if (!q) {
+      router.push("/productos");
+      return;
+    }
+
+    router.push(`/productos?q=${encodeURIComponent(q)}`);
+  }
 
   return (
     <header
@@ -83,14 +111,22 @@ export function Header() {
 
           {/* CENTRO: buscador */}
           <div className="hidden lg:flex justify-center">
-            <div className="relative w-full max-w-[760px]">
+            <form
+              className="relative w-full max-w-[760px]"
+              onSubmit={(e) => {
+                e.preventDefault();
+                goSearch(query);
+              }}
+            >
               <Search className="absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-neutral-400" />
               <input
                 type="search"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
                 placeholder="Buscá tu producto"
                 className="h-11 w-full rounded-full border border-neutral-300 bg-white pl-12 pr-4 text-[15px] text-neutral-900 placeholder:text-neutral-400 focus:border-neutral-400 focus:outline-none"
               />
-            </div>
+            </form>
           </div>
 
           {/* DERECHA: acciones desktop */}
@@ -155,14 +191,22 @@ export function Header() {
           <div className="border-t bg-white md:hidden">
             <div className="py-4">
               {/* Search mobile */}
-              <div className="relative">
+              <form
+                className="relative"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  goSearch(query);
+                }}
+              >
                 <Search className="absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-neutral-400" />
                 <input
                   type="search"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
                   placeholder="Buscá tu producto"
                   className="h-11 w-full rounded-full border border-neutral-300 bg-white pl-12 pr-4 text-[15px] focus:outline-none"
                 />
-              </div>
+              </form>
 
               {/* Links */}
               <nav className="mt-4 flex flex-col gap-3">

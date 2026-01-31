@@ -22,12 +22,6 @@ function safeUUID() {
   return crypto.randomBytes(16).toString("hex");
 }
 
-function makeOrderNumber(numericId: string | number) {
-  const n = Number(numericId);
-  const padded = String(isNaN(n) ? numericId : n).padStart(4, "0");
-  return `AMG-${padded}`;
-}
-
 async function strapiJSON(res: Response) {
   return await res.json().catch(() => null);
 }
@@ -73,51 +67,18 @@ function readMoney(v: any, def = 0) {
 }
 
 /**
- * Lee /api/users/me con el JWT del usuario (cookie strapi_jwt)
- * y devuelve { id, documentId, email } si está logueado.
+ * Lee JWT del usuario desde cookies (probamos varios nombres comunes).
+ * Ajustá/limpiá si ya sabés el nombre exacto.
  */
-async function getLoggedUser(strapiBase: string) {
-  const jwt = cookies().get("strapi_jwt")?.value;
-  if (!jwt) return null;
-
-  try {
-    const r = await fetch(`${strapiBase}/api/users/me`, {
-      headers: { Authorization: `Bearer ${jwt}` },
-      cache: "no-store",
-    });
-
-    if (!r.ok) return null;
-
-    const me = await r.json().catch(() => null);
-
-    const id = me?.id ?? null;
-    const documentId = me?.documentId ?? null;
-    const email =
-      typeof me?.email === "string" ? me.email.trim().toLowerCase() : null;
-
-    if (!id && !documentId) return null;
-
-    return { id, documentId, email };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Construye el payload de Strapi v5 para setear una relación.
- */
-function buildUserRelation(logged: { id: any; documentId: any } | null) {
-  const doc = String(logged?.documentId ?? "").trim();
-  if (doc) {
-    return { user: { connect: [doc] } };
-  }
-
-  const idNum = Number(logged?.id);
-  if (Number.isFinite(idNum) && idNum > 0) {
-    return { user: { connect: [String(idNum)] } };
-  }
-
-  return {};
+function readUserJwtFromCookies() {
+  const jar = cookies();
+  return (
+    jar.get("strapi_jwt")?.value ||
+    jar.get("jwt")?.value ||
+    jar.get("token")?.value ||
+    jar.get("access_token")?.value ||
+    null
+  );
 }
 
 export async function POST(req: Request) {
@@ -127,11 +88,12 @@ export async function POST(req: Request) {
       "http://localhost:1337"
   );
 
-  const token = process.env.STRAPI_TOKEN || process.env.STRAPI_API_TOKEN;
-  if (!token) {
+  // ✅ Ahora el checkout crea órdenes SOLO logueado
+  const jwt = readUserJwtFromCookies();
+  if (!jwt) {
     return NextResponse.json(
-      { error: "Falta STRAPI_TOKEN / STRAPI_API_TOKEN en .env (Next)" },
-      { status: 500 }
+      { error: "No autorizado: iniciá sesión para crear una orden." },
+      { status: 401 }
     );
   }
 
@@ -155,23 +117,14 @@ export async function POST(req: Request) {
     );
   }
 
-  // ✅ usuario logueado (si existe)
-  const logged = await getLoggedUser(strapiBase);
-
   // ===================== VALIDACIONES =====================
 
   const name = isNonEmptyString(incomingData.name) ? incomingData.name.trim() : "";
-
-  // ✅ si está logueado, usamos SIEMPRE el email del usuario
-  const email = logged?.email
-    ? logged.email
-    : isNonEmptyString(incomingData.email)
-      ? incomingData.email.trim().toLowerCase()
-      : "";
-
+  const email = isNonEmptyString(incomingData.email)
+    ? incomingData.email.trim().toLowerCase()
+    : "";
   const phone = isNonEmptyString(incomingData.phone) ? incomingData.phone.trim() : "";
 
-  // ✅ DNI (opcional pero si viene, validamos)
   const dni = normalizeDni(incomingData.dni);
 
   if (name.length < 2) return badRequest("Nombre inválido", { name });
@@ -182,14 +135,14 @@ export async function POST(req: Request) {
     return badRequest("DNI inválido (7 a 10 dígitos)", { dni });
   }
 
-  // ✅ shipping policy
   const shippingMethod: ShippingMethod = readShippingMethod(incomingData.shippingMethod);
   const shippingCost = readMoney(incomingData.shippingCost, 0);
-  const pickupPoint = isNonEmptyString(incomingData.pickupPoint) ? incomingData.pickupPoint.trim() : null;
+  const pickupPoint = isNonEmptyString(incomingData.pickupPoint)
+    ? incomingData.pickupPoint.trim()
+    : null;
 
   if (shippingCost < 0) return badRequest("shippingCost inválido", { shippingCost });
 
-  // Dirección solo si es delivery
   const shipping = readShipping(incomingData);
 
   if (shippingMethod === "delivery") {
@@ -199,8 +152,6 @@ export async function POST(req: Request) {
     if (shipping.province.length < 2) return badRequest("Falta province", { province: shipping.province });
     if (shipping.postalCode.length < 4) return badRequest("Falta postalCode", { postalCode: shipping.postalCode });
   } else {
-    // pickup
-    // si querés exigir pickupPoint:
     if (!pickupPoint) {
       return badRequest("Falta pickupPoint para retiro en sucursal", { pickupPoint });
     }
@@ -228,7 +179,8 @@ export async function POST(req: Request) {
     `${shipping.street} ${shipping.number}, ${shipping.city}, ${shipping.province} (${shipping.postalCode})`;
 
   // 🔒 data “limpio” (whitelist)
-  const baseData: any = {
+  // OJO: NO mandamos user. Lo setea Strapi desde el JWT.
+  const data: any = {
     subtotal: subtotal || undefined,
     discountTotal: discountTotal || undefined,
     coupon: incomingData.coupon ?? undefined,
@@ -237,11 +189,8 @@ export async function POST(req: Request) {
     name,
     email,
     phone,
-
-    // ✅ DNI snapshot
     dni: dni || null,
 
-    // ✅ shipping fields
     shippingMethod,
     shippingCost,
     pickupPoint,
@@ -280,92 +229,38 @@ export async function POST(req: Request) {
     mpExternalReference,
   };
 
-  const relationPart = buildUserRelation(logged);
+  const createPayload = { data };
 
-  // 1) CREATE en Strapi (intento con relación)
-  let createPayload = { data: { ...baseData, ...relationPart } };
-
-  console.log("[orders/create] → Strapi CREATE payload:", JSON.stringify(createPayload, null, 2));
-
-  let createRes = await fetch(`${strapiBase}/api/orders`, {
+  // ✅ Crear la orden en Strapi COMO USUARIO (Bearer JWT)
+  const createRes = await fetch(`${strapiBase}/api/orders`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${jwt}`,
     },
     body: JSON.stringify(createPayload),
     cache: "no-store",
   });
 
-  let created = await strapiJSON(createRes);
-
-  // 🔁 Fallback: si Strapi tira Invalid key user, creamos SIN relación
-  if (!createRes.ok && created?.error?.details?.key === "user") {
-    console.warn("[orders/create] Strapi rechazó relation user, reintento sin user…");
-    createPayload = { data: { ...baseData } };
-
-    createRes = await fetch(`${strapiBase}/api/orders`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(createPayload),
-      cache: "no-store",
-    });
-
-    created = await strapiJSON(createRes);
-  }
+  const created = await strapiJSON(createRes);
 
   if (!createRes.ok) {
-    console.error("[orders/create] Strapi CREATE returned", createRes.status, created);
     return NextResponse.json(
       { error: "Strapi error (create)", details: created },
       { status: createRes.status || 500 }
     );
   }
 
+  // Strapi v5 suele devolver documentId + id
   const documentId = created?.data?.documentId ? String(created.data.documentId) : null;
-  const numericId = created?.data?.id ? String(created.data.id) : null;
-
-  if (!documentId) {
-    return NextResponse.json(
-      { error: "Strapi no devolvió documentId al crear la orden", strapi: created },
-      { status: 500 }
-    );
-  }
-
-  const orderNumber = numericId ? makeOrderNumber(numericId) : null;
-
-  // 2) UPDATE en Strapi para setear orderNumber
-  if (orderNumber) {
-    const updatePayload = { data: { orderNumber, mpExternalReference } };
-    const updateUrl = `${strapiBase}/api/orders/${encodeURIComponent(documentId)}`;
-
-    const updateRes = await fetch(updateUrl, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(updatePayload),
-      cache: "no-store",
-    });
-
-    if (!updateRes.ok) {
-      const upd = await updateRes.text().catch(() => "");
-      console.warn("[orders/create] Strapi UPDATE failed (no bloqueo):", updateRes.status, upd);
-    }
-  } else {
-    console.warn("[orders/create] Strapi no devolvió numericId; no pude calcular orderNumber.");
-  }
+  const numericId = created?.data?.id != null ? String(created.data.id) : null;
+  const orderNumber = created?.data?.orderNumber ?? null; // si lifecycle ya lo seteo
 
   return NextResponse.json({
-    orderId: documentId,
+    orderId: documentId ?? numericId,
     orderDocumentId: documentId,
     orderNumericId: numericId,
     orderNumber,
     mpExternalReference,
-    strapi: created,
   });
 }

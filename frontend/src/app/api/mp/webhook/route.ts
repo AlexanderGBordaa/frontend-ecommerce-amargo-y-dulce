@@ -3,25 +3,6 @@ import { NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
 
-/**
- * Webhook Mercado Pago (Checkout Pro)
- *
- * Objetivo:
- * - Recibe notificación (payment / merchant_order)
- * - Resuelve paymentId real
- * - Consulta el pago en MP
- * - Toma mpExternalReference desde payment.external_reference (o metadata)
- * - Busca la Order en Strapi por filters[mpExternalReference][$eq]
- * - Actualiza Order: orderStatus + mp* fields
- * - ✅ Descuenta stock SOLO una vez cuando pasa a paid (idempotente) usando order.stockAdjusted
- * - ✅ Validación de stock ANTES de descontar (si no hay stock => marca failed y NO descuenta)
- * - ✅ No negativos
- *
- * Strapi v5:
- * - Buscar documentId (NO id)
- * - Actualizar por /api/orders/:documentId
- */
-
 function pickNotificationInfo(url: URL, body: any) {
   const typeFromQuery =
     url.searchParams.get("type") ||
@@ -86,14 +67,9 @@ async function fetchMpPayment(accessToken: string, paymentId: string) {
   return payment;
 }
 
-async function resolvePaymentIdFromMerchantOrder(
-  accessToken: string,
-  merchantOrderId: string
-) {
+async function resolvePaymentIdFromMerchantOrder(accessToken: string, merchantOrderId: string) {
   const moRes = await fetch(
-    `https://api.mercadopago.com/merchant_orders/${encodeURIComponent(
-      merchantOrderId
-    )}`,
+    `https://api.mercadopago.com/merchant_orders/${encodeURIComponent(merchantOrderId)}`,
     {
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -117,28 +93,34 @@ async function resolvePaymentIdFromMerchantOrder(
   return anyPayment?.id ? String(anyPayment.id) : null;
 }
 
-/**
- * ✅ Strapi v5:
- * Trae documentId + orderStatus + datos para email + stockAdjusted + items
- */
+/* ======================= STRAPI HELPERS ======================= */
+
+function flattenStrapiRow(row: any) {
+  if (!row) return null;
+  if (row?.attributes) {
+    // v4-like: { id, documentId?, attributes:{...} }
+    return {
+      id: row?.id ?? null,
+      documentId: row?.documentId ?? row?.attributes?.documentId ?? row?.attributes?.document_id ?? null,
+      ...row.attributes,
+    };
+  }
+  // v5 sometimes flat
+  return row;
+}
+
+/* ======================= ORDER ======================= */
+
 async function findOrderByMpExternalReference(
   strapiBase: string,
   token: string,
   mpExternalReference: string
 ) {
+  // 👇 IMPORTANTE: no usamos fields[] porque puede esconder attributes/documentId según versión
   const q = new URLSearchParams({
     "filters[mpExternalReference][$eq]": mpExternalReference,
     "pagination[pageSize]": "1",
-    "fields[0]": "documentId",
-    "fields[1]": "orderStatus",
-    "fields[2]": "email",
-    "fields[3]": "name",
-    "fields[4]": "orderNumber",
-    "fields[5]": "total",
-    "fields[6]": "items",
-    "fields[7]": "phone",
-    "fields[8]": "shippingAddress",
-    "fields[9]": "stockAdjusted",
+    "populate": "*",
   });
 
   const res = await fetch(`${strapiBase}/api/orders?${q.toString()}`, {
@@ -153,20 +135,34 @@ async function findOrderByMpExternalReference(
     throw new Error(`Strapi search failed (${res.status}) ${text}`);
   }
 
-  const o = data?.data?.[0];
-  if (!o?.documentId) return null;
+  const raw = data?.data?.[0];
+  const flat = flattenStrapiRow(raw);
+
+  if (!flat) return null;
+
+  const documentId =
+    flat?.documentId != null ? String(flat.documentId).trim() : "";
+
+  if (!documentId) {
+    console.error("[Webhook] Order encontrada pero sin documentId. raw:", raw);
+    return null;
+  }
 
   return {
-    documentId: String(o.documentId),
-    orderStatus: (o?.orderStatus ?? o?.attributes?.orderStatus ?? null) as string | null,
-    email: (o?.email ?? o?.attributes?.email ?? null) as string | null,
-    name: (o?.name ?? o?.attributes?.name ?? null) as string | null,
-    orderNumber: (o?.orderNumber ?? o?.attributes?.orderNumber ?? null) as string | null,
-    total: (o?.total ?? o?.attributes?.total ?? null) as number | null,
-    items: (o?.items ?? o?.attributes?.items ?? null) as any,
-    phone: (o?.phone ?? o?.attributes?.phone ?? null) as string | null,
-    shippingAddress: (o?.shippingAddress ?? o?.attributes?.shippingAddress ?? null) as any,
-    stockAdjusted: Boolean(o?.stockAdjusted ?? o?.attributes?.stockAdjusted ?? false),
+    // ✅ claves para operar
+    documentId,
+    numericId: flat?.id ?? raw?.id ?? null, // solo debug
+
+    // ✅ campos del pedido
+    orderStatus: (flat?.orderStatus ?? null) as string | null,
+    email: (flat?.email ?? null) as string | null,
+    name: (flat?.name ?? null) as string | null,
+    orderNumber: (flat?.orderNumber ?? null) as string | null,
+    total: (flat?.total ?? null) as number | null,
+    items: (flat?.items ?? null) as any,
+    phone: (flat?.phone ?? null) as string | null,
+    shippingAddress: (flat?.shippingAddress ?? null) as any,
+    stockAdjusted: Boolean(flat?.stockAdjusted ?? false),
   };
 }
 
@@ -216,8 +212,7 @@ async function findProductByDocumentId(params: {
   const sp = new URLSearchParams();
   sp.set("pagination[pageSize]", "1");
   sp.set("filters[documentId][$eq]", String(productDocumentId));
-  sp.set("fields[0]", "documentId");
-  sp.set("fields[1]", "stock");
+  sp.set("populate", "*");
 
   const res = await fetch(`${strapiBase}/api/products?${sp.toString()}`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -231,61 +226,23 @@ async function findProductByDocumentId(params: {
     throw new Error(`Strapi product search failed (${res.status}) ${text}`);
   }
 
-  const p = data?.data?.[0];
-  if (!p?.documentId) return null;
+  const pRaw = data?.data?.[0];
+  const p = flattenStrapiRow(pRaw);
 
-  const stockRaw = p?.stock ?? p?.attributes?.stock ?? null;
+  const doc =
+    p?.documentId != null ? String(p.documentId).trim() : "";
 
-  // null/undefined => ilimitado
+  if (!doc) return null;
+
+  const stockRaw = p?.stock ?? null;
+
   if (stockRaw === null || stockRaw === undefined) {
-    return { documentId: String(p.documentId), stock: null } as ProductStockRow;
+    return { documentId: doc, stock: null } as ProductStockRow;
   }
 
   const stockNum = Number(stockRaw);
   return {
-    documentId: String(p.documentId),
-    stock: Number.isFinite(stockNum) ? stockNum : 0,
-  } as ProductStockRow;
-}
-
-async function findProductByNumericId(params: {
-  strapiBase: string;
-  token: string;
-  productNumericId: string | number;
-}) {
-  const { strapiBase, token, productNumericId } = params;
-
-  const q = new URLSearchParams({
-    "filters[id][$eq]": String(productNumericId),
-    "pagination[pageSize]": "1",
-    "fields[0]": "documentId",
-    "fields[1]": "stock",
-  });
-
-  const res = await fetch(`${strapiBase}/api/products?${q.toString()}`, {
-    headers: { Authorization: `Bearer ${token}` },
-    cache: "no-store",
-  });
-
-  const data = await res.json().catch(() => null);
-
-  if (!res.ok || !data) {
-    const text = data ? JSON.stringify(data) : "";
-    throw new Error(`Strapi product search failed (${res.status}) ${text}`);
-  }
-
-  const p = data?.data?.[0];
-  if (!p?.documentId) return null;
-
-  const stockRaw = p?.stock ?? p?.attributes?.stock ?? null;
-
-  if (stockRaw === null || stockRaw === undefined) {
-    return { documentId: String(p.documentId), stock: null } as ProductStockRow;
-  }
-
-  const stockNum = Number(stockRaw);
-  return {
-    documentId: String(p.documentId),
+    documentId: doc,
     stock: Number.isFinite(stockNum) ? stockNum : 0,
   } as ProductStockRow;
 }
@@ -314,11 +271,6 @@ async function updateProductStock(params: {
   }
 }
 
-/**
- * ✅ Validación de stock: hace un "preflight" acumulando cantidades por productDocumentId
- * - Si stock es null => ilimitado
- * - Si falta producto o stock < requested => OUT_OF_STOCK
- */
 async function validateStockOrThrow(params: {
   strapiBase: string;
   token: string;
@@ -332,15 +284,12 @@ async function validateStockOrThrow(params: {
     const doc = String(it?.productDocumentId ?? "").trim();
     const qty = Number(it?.qty ?? 0);
     if (!doc || !Number.isFinite(qty) || qty <= 0) continue;
-
     need.set(doc, (need.get(doc) ?? 0) + qty);
   }
 
   const docIds = Array.from(need.keys());
   if (!docIds.length) return;
 
-  // Traemos uno por uno (simple y confiable)
-  // Si querés optimizar: hacemos un $or masivo.
   const problems: Array<{ doc: string; requested: number; available: number }> = [];
 
   for (const doc of docIds) {
@@ -353,7 +302,7 @@ async function validateStockOrThrow(params: {
       continue;
     }
 
-    if (p.stock === null) continue; // ilimitado
+    if (p.stock === null) continue;
 
     if (p.stock < requested) {
       problems.push({ doc, requested, available: p.stock });
@@ -368,12 +317,6 @@ async function validateStockOrThrow(params: {
   }
 }
 
-/**
- * ✅ Descontar stock:
- * - Prioriza productDocumentId (recomendado)
- * - Fallback: productId numérico (si hay)
- * - No negativos (ya validamos antes, pero igual clamp)
- */
 async function adjustStockFromOrderItems(params: {
   strapiBase: string;
   token: string;
@@ -387,35 +330,10 @@ async function adjustStockFromOrderItems(params: {
     if (!Number.isFinite(qty) || qty <= 0) continue;
 
     const docFromItem = String(it?.productDocumentId ?? "").trim();
-    const numericId = it?.productId ?? it?.product_id ?? null;
+    if (!docFromItem) continue;
 
-    let p: ProductStockRow | null = null;
-
-    if (docFromItem) {
-      p = await findProductByDocumentId({
-        strapiBase,
-        token,
-        productDocumentId: docFromItem,
-      });
-    } else if (numericId != null) {
-      p = await findProductByNumericId({
-        strapiBase,
-        token,
-        productNumericId: numericId,
-      });
-    } else {
-      continue;
-    }
-
-    if (!p) {
-      console.warn("[Webhook] No encontré product para descontar stock:", {
-        productDocumentId: docFromItem || null,
-        productId: numericId || null,
-      });
-      continue;
-    }
-
-    // stock null => ilimitado => no tocar
+    const p = await findProductByDocumentId({ strapiBase, token, productDocumentId: docFromItem });
+    if (!p) continue;
     if (p.stock === null) continue;
 
     const nextStock = Math.max(0, p.stock - qty);
@@ -426,17 +344,10 @@ async function adjustStockFromOrderItems(params: {
       productDocumentId: p.documentId,
       newStock: nextStock,
     });
-
-    console.log("[Webhook] Stock actualizado:", {
-      productDocumentId: p.documentId,
-      prevStock: p.stock,
-      qty,
-      nextStock,
-    });
   }
 }
 
-/* ======================= EMAIL (igual que antes) ======================= */
+/* ======================= EMAIL ======================= */
 
 async function sendOrderConfirmationEmail(params: {
   siteUrl: string;
@@ -460,6 +371,34 @@ async function sendOrderConfirmationEmail(params: {
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     throw new Error(`Email send failed (${res.status}) ${t || "(no body)"}`);
+  }
+}
+
+/* ======================= INVOICE ======================= */
+
+async function tryGenerateInvoice(params: { siteUrl: string; orderId: string }) {
+  const { siteUrl, orderId } = params;
+
+  try {
+    const r = await fetch(`${siteUrl}/api/invoices/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ orderId }),
+      cache: "no-store",
+    });
+
+    const j = await r.json().catch(() => null);
+
+    if (!r.ok) {
+      console.error("[Webhook] invoice generate failed:", r.status, j);
+      return { ok: false as const, status: r.status, details: j };
+    }
+
+    console.log("[Webhook] invoice generate ok:", j?.alreadyExists ? "alreadyExists" : "created");
+    return { ok: true as const, data: j };
+  } catch (e: any) {
+    console.error("[Webhook] invoice generate fetch error:", e?.message || e);
+    return { ok: false as const, status: 0, details: e?.message || String(e) };
   }
 }
 
@@ -526,9 +465,7 @@ export async function POST(req: Request) {
     const mpExternalReference = String(mpExternalReferenceRaw);
 
     const strapiBase = normalizeStrapiBase(
-      process.env.STRAPI_URL ||
-        process.env.NEXT_PUBLIC_STRAPI_URL ||
-        "http://localhost:1337"
+      process.env.STRAPI_URL || process.env.NEXT_PUBLIC_STRAPI_URL || "http://localhost:1337"
     );
 
     const token = process.env.STRAPI_TOKEN || process.env.STRAPI_API_TOKEN;
@@ -537,7 +474,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    // ✅ Traemos el estado actual + datos para email + stockAdjusted
     let order: Awaited<ReturnType<typeof findOrderByMpExternalReference>> = null;
     try {
       order = await findOrderByMpExternalReference(strapiBase, token, mpExternalReference);
@@ -554,12 +490,6 @@ export async function POST(req: Request) {
     const prevStatus = order.orderStatus || "pending";
     const nextStatus = mapMpToOrderStatus(mpStatus);
 
-    // Idempotencia extra: si ya está paid y ya stockAdjusted, no hacemos nada
-    if (prevStatus === "paid" && order.stockAdjusted) {
-      return NextResponse.json({ ok: true, idempotent: true }, { status: 200 });
-    }
-
-    // 1) Actualizamos estado mp en la orden (siempre)
     const updatePayload = {
       data: {
         orderStatus: nextStatus,
@@ -571,6 +501,7 @@ export async function POST(req: Request) {
       },
     };
 
+    console.log("[Webhook] order ids:", { documentId: order.documentId, numericId: order.numericId });
     console.log("[Webhook] prevStatus -> nextStatus:", prevStatus, "->", nextStatus);
     console.log("[Webhook] stockAdjusted:", order.stockAdjusted);
 
@@ -586,19 +517,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    // ✅ Anti-duplicados: SOLO si pasa a paid
     const becamePaid = prevStatus !== "paid" && nextStatus === "paid";
 
     if (becamePaid) {
       const items = Array.isArray(order.items) ? order.items : [];
 
-      // 2) Validar stock ANTES de descontar (si no hay, marcamos failed y cortamos)
       try {
         await validateStockOrThrow({ strapiBase, token, items });
       } catch (e: any) {
         console.error("[Webhook] OUT_OF_STOCK:", e?.problems || e?.message || e);
 
-        // marcamos orden como failed (pero devolvemos 200 para no reintentar infinitamente)
         try {
           await updateOrderInStrapi({
             strapiBase,
@@ -620,7 +548,6 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: true, reason: "OUT_OF_STOCK" }, { status: 200 });
       }
 
-      // 3) Descontar stock SOLO una vez (idempotente por stockAdjusted)
       if (!order.stockAdjusted) {
         try {
           await adjustStockFromOrderItems({ strapiBase, token, items });
@@ -636,11 +563,19 @@ export async function POST(req: Request) {
         } catch (e: any) {
           console.error("[Webhook] Error descontando stock:", e?.message || e);
         }
-      } else {
-        console.log("[Webhook] Ya estaba stockAdjusted=true, no descuento stock.");
       }
+    }
 
-      // 4) Email confirmación (solo al pasar a paid)
+    if (nextStatus === "paid") {
+      const siteUrl =
+        process.env.SITE_URL ||
+        process.env.NEXT_PUBLIC_SITE_URL ||
+        `${url.protocol}//${url.host}`;
+
+      await tryGenerateInvoice({ siteUrl, orderId: order.documentId });
+    }
+
+    if (becamePaid) {
       const siteUrl =
         process.env.SITE_URL ||
         process.env.NEXT_PUBLIC_SITE_URL ||
@@ -661,20 +596,14 @@ export async function POST(req: Request) {
           });
           console.log("[Webhook] Email de confirmación enviado:", { to, orderNumber: order.orderNumber });
         } catch (e: any) {
-          console.error("[Webhook] Error enviando email (Resend):", e?.message || e);
+          console.error("[Webhook] Error enviando email:", e?.message || e);
         }
       } else {
-        console.warn("[Webhook] Orden pagada pero sin email, no envío confirmación.", {
-          mpExternalReference,
-          orderDocumentId: order.documentId,
-        });
+        console.warn("[Webhook] Order paid pero sin email en order:", { documentId: order.documentId });
       }
     }
 
-    return NextResponse.json(
-      { ok: true, becamePaid, stockAdjusted: becamePaid ? !order.stockAdjusted : undefined },
-      { status: 200 }
-    );
+    return NextResponse.json({ ok: true, becamePaid }, { status: 200 });
   } catch (err: any) {
     console.error("[Webhook] fatal error:", err?.message || err);
     return NextResponse.json({ ok: true }, { status: 200 });

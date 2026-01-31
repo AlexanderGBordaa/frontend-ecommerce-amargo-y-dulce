@@ -23,6 +23,7 @@ const nextConfig = {
         hostname: "res.cloudinary.com",
         pathname: "/**",
       },
+      
 
       // 🔁 ngrok (si exponés Strapi)
       // {
@@ -31,6 +32,10 @@ const nextConfig = {
       //   pathname: "/uploads/**",
       // },
     ],
+  },
+  
+  experimental: {
+    serverComponentsExternalPackages: ["pdfkit"],
   },
 };
 

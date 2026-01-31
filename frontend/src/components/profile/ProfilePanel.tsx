@@ -475,6 +475,14 @@ export function ProfilePanel({
 
                 <div className="flex flex-wrap gap-2">
                   <Link
+                  href="/facturas"
+                  onClick={() => onClose?.()}
+                  className="rounded-xl bg-neutral-900 px-4 py-2 text-sm font-bold text-white"
+                  >
+                    Mis recibos
+                  </Link>
+
+                  <Link
                     href="/mis-pedidos"
                     onClick={() => onClose?.()}
                     className="rounded-xl bg-neutral-900 px-4 py-2 text-sm font-bold text-white"
@@ -485,14 +493,14 @@ export function ProfilePanel({
                   <Link
                     href="/productos"
                     onClick={() => onClose?.()}
-                    className="rounded-xl border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-900"
+                    className="rounded-xl bg-neutral-900 px-4 py-2 text-sm font-bold text-white"
                   >
                     Seguir comprando
                   </Link>
 
                   <button
                     onClick={handleLogout}
-                    className="rounded-xl border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-900"
+                    className="rounded-xl bg-neutral-900 px-4 py-2 text-sm font-bold text-white"
                     type="button"
                   >
                     Cerrar sesión

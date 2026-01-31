@@ -4,15 +4,7 @@ import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Container } from "./Container";
-import {
-  Search,
-  ShoppingCart,
-  User,
-  Menu,
-  X,
-  Package,
-  LogOut,
-} from "lucide-react";
+import { Search, ShoppingCart, User, Menu, X, LogOut } from "lucide-react";
 import { LoginModal } from "@/components/auth/LoginModal";
 import { CartBadge } from "@/components/cart/CartBadge";
 import { ProfilePanel } from "@/components/profile/ProfilePanel";
@@ -43,7 +35,14 @@ function NavLink({
     <Link
       href={href}
       onClick={onClick}
-      className="text-[15px] font-medium text-neutral-800 hover:text-neutral-950 transition"
+      className="
+        text-[15px] font-medium
+        text-neutral-700
+        hover:text-neutral-900
+        hover:underline
+        underline-offset-4
+        transition-colors
+      "
     >
       {children}
     </Link>
@@ -215,10 +214,9 @@ export function Header() {
 
     setLoadingSuggest(true);
     try {
-      const r = await fetch(
-        `/api/search/suggest?q=${encodeURIComponent(qq)}`,
-        { cache: "no-store" }
-      );
+      const r = await fetch(`/api/search/suggest?q=${encodeURIComponent(qq)}`, {
+        cache: "no-store",
+      });
       const data = await r.json();
       const res = Array.isArray(data?.results) ? data.results.slice(0, 5) : [];
       setSuggestions(res);
@@ -289,15 +287,12 @@ export function Header() {
   function SearchBox({ variant }: { variant: "desktop" | "mobile" }) {
     const showDropdown = openSuggest && query.trim().length >= 2;
 
-    const ref =
-      variant === "desktop" ? suggestBoxRefDesktop : suggestBoxRefMobile;
+    const ref = variant === "desktop" ? suggestBoxRefDesktop : suggestBoxRefMobile;
 
     return (
       <div ref={ref} className="relative w-full">
         <form
-          className={
-            variant === "desktop" ? "relative w-full max-w-[760px]" : "relative"
-          }
+          className={variant === "desktop" ? "relative w-full max-w-[760px]" : "relative"}
           onSubmit={(e) => {
             e.preventDefault();
             goSearch(query);
@@ -321,30 +316,18 @@ export function Header() {
             }
             aria-autocomplete="list"
             aria-expanded={showDropdown}
-            aria-controls={
-              variant === "desktop"
-                ? "suggestions-desktop"
-                : "suggestions-mobile"
-            }
+            aria-controls={variant === "desktop" ? "suggestions-desktop" : "suggestions-mobile"}
           />
         </form>
 
         {showDropdown && (
           <div className="absolute left-0 right-0 z-50 mt-2 overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-lg">
             <div className="px-4 py-2 text-xs text-neutral-500">
-              {loadingSuggest
-                ? "Buscando..."
-                : suggestions.length
-                ? "Sugerencias"
-                : "Sin resultados"}
+              {loadingSuggest ? "Buscando..." : suggestions.length ? "Sugerencias" : "Sin resultados"}
             </div>
 
             <ul
-              id={
-                variant === "desktop"
-                  ? "suggestions-desktop"
-                  : "suggestions-mobile"
-              }
+              id={variant === "desktop" ? "suggestions-desktop" : "suggestions-mobile"}
               role="listbox"
               className="max-h-80 overflow-auto"
             >
@@ -424,9 +407,7 @@ export function Header() {
 
           {/* CENTRO */}
           <div className="hidden lg:flex justify-center">
-            <div className="relative w-full max-w-[760px]">
-              {SearchBox({ variant: "desktop" })}
-            </div>
+            <div className="relative w-full max-w-[760px]">{SearchBox({ variant: "desktop" })}</div>
           </div>
 
           {/* DERECHA */}
@@ -438,7 +419,7 @@ export function Header() {
                 <>
                   <button
                     onClick={() => setLoginOpen(true)}
-                    className="flex items-center gap-2 text-[15px] font-medium text-neutral-800 hover:text-neutral-950"
+                    className="flex items-center gap-2 text-[15px] font-medium text-neutral-500 hover:text-neutral-900 transition-colors"
                     type="button"
                     aria-expanded={loginOpen}
                   >
@@ -446,16 +427,13 @@ export function Header() {
                     Iniciar sesión
                   </button>
 
-                  <LoginModal
-                    open={loginOpen}
-                    onClose={() => setLoginOpen(false)}
-                  />
+                  <LoginModal open={loginOpen} onClose={() => setLoginOpen(false)} />
                 </>
               ) : (
                 <>
                   <button
                     onClick={() => setProfileOpen((v) => !v)}
-                    className="flex items-center gap-2 text-[15px] font-medium text-neutral-800 hover:text-neutral-950 transition"
+                    className="flex items-center gap-2 text-[15px] font-medium text-neutral-500 hover:text-neutral-900 transition-colors"
                     type="button"
                     aria-expanded={profileOpen}
                     disabled={meLoading}
@@ -466,16 +444,12 @@ export function Header() {
 
                   {profileOpen && (
                     <>
-                      <div
-                        className="fixed inset-0 z-40"
-                        onClick={() => setProfileOpen(false)}
-                      />
-
+                      <div className="fixed inset-0 z-40" onClick={() => setProfileOpen(false)} />
                       <div className="absolute right-0 top-12 z-50">
                         <ProfilePanel
                           variant="dropdown"
                           onClose={() => setProfileOpen(false)}
-                          onLogout={logout}  
+                          onLogout={logout}
                         />
                       </div>
                     </>
@@ -488,7 +462,7 @@ export function Header() {
 
             <Link
               href="/carrito"
-              className="relative flex items-center gap-2 text-[15px] font-medium text-neutral-800 hover:text-neutral-950"
+              className="relative flex items-center gap-2 text-[15px] font-medium text-neutral-500 hover:text-neutral-900 transition-colors"
             >
               <span className="relative inline-flex">
                 <ShoppingCart className="h-5 w-5" />
@@ -516,11 +490,7 @@ export function Header() {
               aria-expanded={mobileOpen}
               type="button"
             >
-              {mobileOpen ? (
-                <X className="h-5 w-5" />
-              ) : (
-                <Menu className="h-5 w-5" />
-              )}
+              {mobileOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
             </button>
           </div>
         </div>
